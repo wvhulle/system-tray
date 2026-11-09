@@ -7,11 +7,12 @@ use crate::dbus::notifier_watcher_proxy::StatusNotifierWatcherProxy;
 use crate::dbus::status_notifier_watcher::StatusNotifierWatcher;
 use crate::dbus::{self, OwnedValueExt};
 use crate::error::{Error, Result};
-use crate::item::{self, IconPixmap, Status, StatusNotifierItem, Tooltip};
+use crate::item::{self, IconPixmap, Status, StatusNotifierItem, Tooltip, TypedItemProperties};
 use crate::menu::{MenuDiff, TrayMenu};
 use crate::names;
 use dbus::DBusProps;
 use futures_lite::{Stream, StreamExt};
+use std::collections::HashMap;
 use std::future::Future;
 use std::result;
 use std::sync::{Arc, Mutex};
@@ -22,7 +23,7 @@ use tokio::time::{sleep, timeout, Instant};
 use tracing::{debug, error, trace, warn};
 use zbus::fdo::{DBusProxy, PropertiesProxy};
 use zbus::names::InterfaceName;
-use zbus::zvariant::{Array, Structure, Value};
+use zbus::zvariant::{Array, OwnedValue, Structure, Value};
 use zbus::{Connection, Message};
 
 use self::names::ITEM_OBJECT;
@@ -378,14 +379,9 @@ impl Client {
         path: &str,
         properties_proxy: &PropertiesProxy<'_>,
     ) -> Result<StatusNotifierItem> {
-        let properties = retry_with_delays(
+        let properties_reply = retry_with_delays(
             ITEM_RETRY_DELAYS,
-            || {
-                properties_proxy.get_all(
-                    InterfaceName::from_static_str(PROPERTIES_INTERFACE)
-                        .expect("to be valid interface name"),
-                )
-            },
+            || Self::call_get_all_properties(properties_proxy),
             |error, delay| {
                 warn!(
                     "failed to read tray item {destination}{path}: {error}; retrying in {} ms",
@@ -395,7 +391,36 @@ impl Client {
         )
         .await?;
 
-        StatusNotifierItem::try_from(DBusProps(properties))
+        match properties_reply.body().deserialize::<TypedItemProperties>() {
+            Ok(typed_properties) => StatusNotifierItem::try_from(typed_properties),
+            Err(typed_decode_error) => {
+                debug!(
+                    "tray item {destination}{path}: typed properties unreadable ({typed_decode_error}), reading them as values"
+                );
+                let properties = properties_reply
+                    .body()
+                    .deserialize::<HashMap<String, OwnedValue>>()?;
+                StatusNotifierItem::try_from(DBusProps(properties))
+            }
+        }
+    }
+
+    async fn call_get_all_properties(
+        properties_proxy: &PropertiesProxy<'_>,
+    ) -> zbus::Result<Message> {
+        properties_proxy
+            .inner()
+            .call_method("GetAll", &(PROPERTIES_INTERFACE,))
+            .await
+    }
+
+    async fn read_typed_properties(
+        properties_proxy: &PropertiesProxy<'_>,
+    ) -> Result<TypedItemProperties> {
+        Ok(Self::call_get_all_properties(properties_proxy)
+            .await?
+            .body()
+            .deserialize::<TypedItemProperties>()?)
     }
 
     /// Watches an SNI item's properties,
@@ -511,34 +536,41 @@ impl Client {
                     .map(OwnedValueExt::to_string)
                     .transpose()?,
             )),
-            "NewIcon" => {
-                let icon_name = get_property!("IconName")
-                    .unwrap_or_else(|e| {
-                        warn!("Error getting IconName: {e:?}");
-                        None
-                    })
-                    .as_ref()
-                    .map(OwnedValueExt::to_string)
-                    .transpose()
-                    .ok()
-                    .flatten();
+            "NewIcon" => match Self::read_typed_properties(properties_proxy).await {
+                Ok(typed_properties) => Some(Icon {
+                    icon_name: typed_properties.icon_name,
+                    icon_pixmap: typed_properties.icon_pixmap,
+                }),
+                Err(typed_read_error) => {
+                    debug!("typed icon properties unreadable ({typed_read_error}), reading them as values");
+                    let icon_name = get_property!("IconName")
+                        .unwrap_or_else(|e| {
+                            warn!("Error getting IconName: {e:?}");
+                            None
+                        })
+                        .as_ref()
+                        .map(OwnedValueExt::to_string)
+                        .transpose()
+                        .ok()
+                        .flatten();
 
-                let icon_pixmap = get_property!("IconPixmap")
-                    .unwrap_or_else(|e| {
-                        warn!("Error getting IconPixmap: {e:?}");
-                        None
-                    })
-                    .as_deref()
-                    .map(Value::downcast_ref::<&Array>)
-                    .and_then(result::Result::ok)
-                    .map(IconPixmap::from_array)
-                    .and_then(result::Result::ok);
+                    let icon_pixmap = get_property!("IconPixmap")
+                        .unwrap_or_else(|e| {
+                            warn!("Error getting IconPixmap: {e:?}");
+                            None
+                        })
+                        .as_deref()
+                        .map(Value::downcast_ref::<&Array>)
+                        .and_then(result::Result::ok)
+                        .map(IconPixmap::from_array)
+                        .and_then(result::Result::ok);
 
-                Some(Icon {
-                    icon_name,
-                    icon_pixmap,
-                })
-            }
+                    Some(Icon {
+                        icon_name,
+                        icon_pixmap,
+                    })
+                }
+            },
             "NewOverlayIcon" => Some(OverlayIcon(
                 get_property!("OverlayIconName")?
                     .as_ref()
