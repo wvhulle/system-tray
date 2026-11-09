@@ -2,7 +2,7 @@ use crate::dbus::DBusProps;
 use crate::error::{Error, Result};
 use serde::{Deserialize, Serialize};
 use std::fmt::{Debug, Formatter};
-use zbus::zvariant::{Array, Structure};
+use zbus::zvariant::{Array, DeserializeDict, OwnedObjectPath, Structure, Type};
 
 /// Represents an item to display inside the tray.
 /// <https://www.freedesktop.org/wiki/Specifications/StatusNotifierItem/StatusNotifierItem/>
@@ -128,7 +128,7 @@ impl From<&str> for Status {
     }
 }
 
-#[derive(Deserialize, Serialize, Clone, Eq, PartialEq, Hash)]
+#[derive(Deserialize, Serialize, Type, Clone, Eq, PartialEq, Hash)]
 pub struct IconPixmap {
     pub width: i32,
     pub height: i32,
@@ -166,8 +166,8 @@ impl IconPixmap {
                     .downcast_ref::<i32>()?;
 
                 let height = fields
-                    .first()
-                    .ok_or(Error::InvalidData("invalid or missing width"))?
+                    .get(1)
+                    .ok_or(Error::InvalidData("invalid or missing height"))?
                     .downcast_ref::<i32>()?;
 
                 let pixel_values = fields
@@ -192,7 +192,7 @@ impl IconPixmap {
 
 /// Data structure that describes extra information associated to this item, that can be visualized for instance by a tooltip
 /// (or by any other mean the visualization consider appropriate.
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize, Type)]
 pub struct Tooltip {
     pub icon_name: String,
     pub icon_data: Vec<IconPixmap>,
@@ -231,6 +231,60 @@ impl TryFrom<&Structure<'_>> for Tooltip {
                 .ok_or(Error::InvalidData("description"))?
                 .downcast_ref::<&str>()
                 .map(ToString::to_string)?,
+        })
+    }
+}
+
+#[derive(Debug, Default, DeserializeDict, Type)]
+#[zvariant(signature = "a{sv}", rename_all = "PascalCase")]
+pub(crate) struct TypedItemProperties {
+    pub(crate) id: Option<String>,
+    pub(crate) category: Option<String>,
+    pub(crate) title: Option<String>,
+    pub(crate) status: Option<String>,
+    pub(crate) window_id: Option<i32>,
+    pub(crate) icon_theme_path: Option<String>,
+    pub(crate) icon_name: Option<String>,
+    pub(crate) icon_pixmap: Option<Vec<IconPixmap>>,
+    pub(crate) overlay_icon_name: Option<String>,
+    pub(crate) overlay_icon_pixmap: Option<Vec<IconPixmap>>,
+    pub(crate) attention_icon_name: Option<String>,
+    pub(crate) attention_icon_pixmap: Option<Vec<IconPixmap>>,
+    pub(crate) attention_movie_name: Option<String>,
+    pub(crate) tool_tip: Option<Tooltip>,
+    pub(crate) item_is_menu: Option<bool>,
+    pub(crate) menu: Option<OwnedObjectPath>,
+}
+
+impl TryFrom<TypedItemProperties> for StatusNotifierItem {
+    type Error = Error;
+
+    fn try_from(properties: TypedItemProperties) -> Result<Self> {
+        Ok(Self {
+            id: properties.id.ok_or(Error::MissingProperty("Id"))?,
+            category: properties
+                .category
+                .as_deref()
+                .map(Category::from)
+                .unwrap_or_default(),
+            title: properties.title,
+            status: properties
+                .status
+                .as_deref()
+                .map(Status::from)
+                .unwrap_or_default(),
+            window_id: properties.window_id.unwrap_or_default() as u32,
+            icon_theme_path: properties.icon_theme_path,
+            icon_name: properties.icon_name,
+            icon_pixmap: properties.icon_pixmap,
+            overlay_icon_name: properties.overlay_icon_name,
+            overlay_icon_pixmap: properties.overlay_icon_pixmap,
+            attention_icon_name: properties.attention_icon_name,
+            attention_icon_pixmap: properties.attention_icon_pixmap,
+            attention_movie_name: properties.attention_movie_name,
+            tool_tip: properties.tool_tip,
+            item_is_menu: properties.item_is_menu.unwrap_or_default(),
+            menu: properties.menu.map(|menu_path| menu_path.to_string()),
         })
     }
 }
@@ -298,5 +352,89 @@ impl DBusProps {
     fn get_tooltip(&self) -> Option<Result<Tooltip>> {
         self.get::<Structure>("ToolTip")
             .map(|t| t.and_then(Tooltip::try_from))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashMap;
+    use zbus::zvariant::{serialized::Context, to_bytes, OwnedValue, SerializeDict, LE};
+
+    #[derive(SerializeDict, Type)]
+    #[zvariant(signature = "a{sv}", rename_all = "PascalCase")]
+    struct EncodedItemProperties {
+        id: Option<String>,
+        icon_name: Option<String>,
+        icon_pixmap: Option<Vec<IconPixmap>>,
+        unrecognised_extension: Option<u32>,
+    }
+
+    fn solid_pixmap(width: i32, height: i32) -> IconPixmap {
+        IconPixmap {
+            width,
+            height,
+            pixels: vec![0x7f; (width * height * 4) as usize],
+        }
+    }
+
+    fn encoded_properties() -> zbus::zvariant::serialized::Data<'static, 'static> {
+        let encoded = EncodedItemProperties {
+            id: Some("electron-app".to_string()),
+            icon_name: Some(String::new()),
+            icon_pixmap: Some(vec![solid_pixmap(512, 512), solid_pixmap(32, 16)]),
+            unrecognised_extension: Some(7),
+        };
+        to_bytes(Context::new_dbus(LE, 0), &encoded).unwrap()
+    }
+
+    #[test]
+    fn typed_properties_keep_every_pixmap_dimension_and_skip_unknown_keys() {
+        let (typed_properties, _) = encoded_properties()
+            .deserialize::<TypedItemProperties>()
+            .unwrap();
+        let item = StatusNotifierItem::try_from(typed_properties).unwrap();
+        let pixmap_dimensions: Vec<(i32, i32, usize)> = item
+            .icon_pixmap
+            .unwrap()
+            .iter()
+            .map(|pixmap| (pixmap.width, pixmap.height, pixmap.pixels.len()))
+            .collect();
+        assert_eq!(item.id, "electron-app");
+        assert_eq!(
+            pixmap_dimensions,
+            [(512, 512, 512 * 512 * 4), (32, 16, 32 * 16 * 4)]
+        );
+    }
+
+    #[test]
+    fn value_fallback_reads_the_height_of_a_non_square_pixmap() {
+        let (properties, _) = encoded_properties()
+            .deserialize::<HashMap<String, OwnedValue>>()
+            .unwrap();
+        let item = StatusNotifierItem::try_from(DBusProps(properties)).unwrap();
+        let non_square_pixmap = &item.icon_pixmap.unwrap()[1];
+        assert_eq!(
+            (non_square_pixmap.width, non_square_pixmap.height),
+            (32, 16)
+        );
+    }
+
+    #[test]
+    fn typed_properties_without_an_id_are_rejected() {
+        let encoded = EncodedItemProperties {
+            id: None,
+            icon_name: None,
+            icon_pixmap: None,
+            unrecognised_extension: None,
+        };
+        let (typed_properties, _) = to_bytes(Context::new_dbus(LE, 0), &encoded)
+            .unwrap()
+            .deserialize::<TypedItemProperties>()
+            .unwrap();
+        assert!(matches!(
+            StatusNotifierItem::try_from(typed_properties),
+            Err(Error::MissingProperty("Id"))
+        ));
     }
 }
